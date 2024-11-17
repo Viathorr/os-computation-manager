@@ -211,6 +211,9 @@ void runGroup() {
     int activity = select(maxFd + 1, &readfds, NULL, NULL, NULL);
 
     if (activity < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
       perror("select error");
       break;
     }
@@ -288,8 +291,11 @@ void printSummary() {
 }
 
 int main() {
+  std::cout << "~~~~~~ Computation Manager ~~~~~"
+            << "\n\nType 'help' for a list of commands.\n"
+            << std::endl;
   std::string command;
-  int currInd = 0;
+  int groupId = 0;
 
   while (true) {
     std::cout << "> ";
@@ -301,27 +307,22 @@ int main() {
 
     if (cmd == "group") {
       clearGroup();
-      std::string next;
       int x;
-      int limit;
+      int limit = -1;
       iss >> x;
-      if (iss >> next) {
-        std::transform(next.begin(), next.end(), next.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        if (next == "limit") {
+      if (iss.good()) {
+        std::string limitStr;
+        iss >> limitStr;
+        if (limitStr == "limit") {
           iss >> limit;
         } else {
-          std::cout << "Invalid command. Please try again." << std::endl;
+          std::cerr << "Invalid command. Please try again." << std::endl;
         }
-      } else {
-        limit = -1;
       }
 
-      createGroup(currInd++, x, limit);
+      createGroup(groupId++, x, limit);
     } else if (cmd == "new") {
       char componentType;
-      int limit;
-      std::string next;
       iss >> componentType;
 
       createComponent(componentType);
@@ -330,12 +331,11 @@ int main() {
     } else if (cmd == "summary") {
       printSummary();
     } else if (cmd == "exit") {
-      std::cout << "Exiting..." << std::endl;
       break;
     } else if (cmd == "help") {
       showHelp();
     } else {
-      std::cout << "Invalid command. Please try again." << std::endl;
+      std::cerr << "Invalid command. Please try again." << std::endl;
     }
   }
 
