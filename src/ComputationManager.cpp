@@ -6,13 +6,13 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <cctype>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <iostream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -31,8 +31,8 @@ struct Component {
   pid_t pid;
   int sym;
   std::string fifoPath;
-  int limit;
   int result;
+  bool resultIsAvailable = false;
 };
 
 struct Group {
@@ -40,9 +40,54 @@ struct Group {
   std::vector<Component> components;
   int limit;
   int x;
+  bool completed = false;
 };
 
 Group group;
+Component* currentComponent = NULL;
+
+bool groupTimeout = false;
+void handleGroupTimeout(int signal) { groupTimeout = true; }
+
+void showHelp() {
+  std::cout << R"(
+  Computation Manager - User Guide
+
+  This tool allows you to create and manage groups of computational components. Each component performs a specific task on a given input (`x`).
+
+  Available Commands:
+  1. group <x> [limit <time>]
+    - Creates a new group of components with input x.
+    - Optional: Specify a group-level time limit in seconds.
+    - Example:
+      - group 5 (creates a group with x = 5 and no time limit).
+      - group 10 limit 20 (creates a group with x = 10 and a 20-second time limit).
+
+  2. new <type>
+    - Adds a new component to the current group.
+    - <type> specifies the type of computation:
+      - A: Computes the square of x.
+      - B: Adds 10 to x.
+      - C: Subtracts 5 from x.
+    - Example:
+      - new A (adds a type A component to the group).
+      - new B (adds a type B component to the group).
+
+  3. run
+    - Executes all components in the current group.
+    - Components with group time limits will be terminated if they exceed the limit.
+
+  4. summary
+    - Displays the results of computations for all components in the group.
+    - Includes details for components that failed due to time limits.
+
+  5. exit
+    - Exits the program.
+
+  6. help
+    - Displays this help message.
+  )";
+}
 
 void createGroup(int groupId, int x, int limit) {
   group.ind = groupId;
@@ -54,9 +99,12 @@ void createGroup(int groupId, int x, int limit) {
             << " and limit = " << (limit == -1 ? 0 : limit) << std::endl;
 }
 
-void clearGroup() { group = Group(); }
+void clearGroup() {
+  group = Group();
+  groupTimeout = false;
+}
 
-void createComponent(char sym, int limit) {
+void createComponent(char sym) {
   Component component;
 
   component.ind = group.components.size() + 1;
@@ -69,7 +117,6 @@ void createComponent(char sym, int limit) {
     return;
   }
 
-  component.limit = limit;
   component.fifoPath = BASE_FIFO_PATH + "component_" +
                        std::to_string(group.ind) + "_" +
                        std::to_string(component.ind);
@@ -78,14 +125,18 @@ void createComponent(char sym, int limit) {
 
   group.components.push_back(component);
 
-  std::cout << "Computational component " + std::to_string(component.sym) +
-                   " with idx " + std::to_string(component.ind) +
-                   " and limit " + std::to_string(limit == -1 ? 0 : limit) +
+  std::cout << "Computational component '" << sym
+            << "' with idx " + std::to_string(component.ind) +
                    " added to group " + std::to_string(group.ind)
             << std::endl;
 }
 
 void runGroup() {
+  if (group.completed) {
+    std::cout << "Computations are already completed." << std::endl;
+    return;
+  }
+
   if (group.components.empty()) {
     cout << "No components to run." << std::endl;
     return;
@@ -96,6 +147,12 @@ void runGroup() {
   std::map<int, Component*> fds;
   fd_set readfds;
   int maxFd = 0;
+
+  if (group.limit > 0) {
+    groupTimeout = false;
+    signal(SIGALRM, handleGroupTimeout);
+    alarm(group.limit);
+  }
 
   for (auto& component : group.components) {
     pid_t pid = fork();
@@ -137,13 +194,14 @@ void runGroup() {
       }
 
       fds[fifoFd] = &component;
+
       if (fifoFd > maxFd) {
         maxFd = fifoFd;
       }
     }
   }
 
-  while (!fds.empty()) {
+  while (!fds.empty() && !groupTimeout) {
     FD_ZERO(&readfds);
 
     for (const auto& [fd, _] : fds) {
@@ -167,6 +225,7 @@ void runGroup() {
         if (bytesRead > 0) {
           cout << "Component " << component->ind << " finished." << std::endl;
           component->result = result;
+          component->resultIsAvailable = true;
           close(fd);
           it = fds.erase(it);
         } else {
@@ -178,12 +237,20 @@ void runGroup() {
     }
   }
 
+  if (groupTimeout) {
+    std::cout << "Group timeout. Cancelling all components." << std::endl;
+    for (auto& component : group.components) {
+      kill(component.pid, SIGKILL);
+    }
+  }
+
   for (auto& component : group.components) {
     waitpid(component.pid, NULL, 0);
     unlink(component.fifoPath.c_str());
   }
 
   cout << "Computation finished." << std::endl;
+  group.completed = true;
 }
 
 void printSummary() {
@@ -210,10 +277,12 @@ void printSummary() {
         std::cout << "[Unknown Type]: ";
     }
 
-    if (component.result) {
+    if (component.resultIsAvailable) {
       std::cout << "Result: " << component.result << std::endl;
     } else {
-      std::cout << "Result is not available." << std::endl;
+      std::cout << "Result is not available (Component's computation was "
+                   "cancelled due to the time limit or hasn't started yet)."
+                << std::endl;
     }
   }
 }
@@ -254,19 +323,8 @@ int main() {
       int limit;
       std::string next;
       iss >> componentType;
-      if (iss >> next) {
-        std::transform(next.begin(), next.end(), next.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        if (next == "limit") {
-          iss >> limit;
-        } else {
-          std::cout << "Invalid command. Please try again." << std::endl;
-          continue;
-        }
-      } else {
-        limit = -1;
-      }
-      createComponent(componentType, limit);
+
+      createComponent(componentType);
     } else if (cmd == "run") {
       runGroup();
     } else if (cmd == "summary") {
@@ -274,6 +332,8 @@ int main() {
     } else if (cmd == "exit") {
       std::cout << "Exiting..." << std::endl;
       break;
+    } else if (cmd == "help") {
+      showHelp();
     } else {
       std::cout << "Invalid command. Please try again." << std::endl;
     }
@@ -286,7 +346,7 @@ int main() {
 
 int componentA(int x) {
   // square of x
-  sleep(3);
+  sleep(7);
   return x * x;
 }
 
@@ -298,6 +358,6 @@ int componentB(int x) {
 
 int componentC(int x) {
   // subtract 5 from x
-  sleep(7);
+  sleep(3);
   return x - 5;
 }
