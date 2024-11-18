@@ -6,15 +6,18 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 using namespace std;
 
@@ -33,6 +36,7 @@ struct Component {
   std::string fifoPath;
   int result;
   bool resultIsAvailable = false;
+  int limit = -1;
 };
 
 struct Group {
@@ -45,9 +49,9 @@ struct Group {
 
 Group group;
 Component* currentComponent = NULL;
+std::mutex myMutex;
 
 bool groupTimeout = false;
-void handleGroupTimeout(int signal) { groupTimeout = true; }
 
 void showHelp() {
   std::cout << R"(
@@ -63,15 +67,18 @@ void showHelp() {
       - group 5 (creates a group with x = 5 and no time limit).
       - group 10 limit 20 (creates a group with x = 10 and a 20-second time limit).
 
-  2. new <type>
+  Note: Every time you type in this command, the previous group and its summary will be cleared.
+
+  2. new <type> [limit <time>]
     - Adds a new component to the current group.
     - <type> specifies the type of computation:
       - A: Computes the square of x.
       - B: Adds 10 to x.
       - C: Subtracts 5 from x.
+    - Optional: Specify a component-level time limit in seconds.
     - Example:
       - new A (adds a type A component to the group).
-      - new B (adds a type B component to the group).
+      - new B limit 5 (adds a type B component to the group and a 5-second time limit).
 
   3. run
     - Executes all components in the current group.
@@ -86,7 +93,7 @@ void showHelp() {
 
   6. help
     - Displays this help message.
-  )";
+)";
 }
 
 void createGroup(int groupId, int x, int limit) {
@@ -96,7 +103,14 @@ void createGroup(int groupId, int x, int limit) {
   group.limit = limit;
 
   std::cout << "New group " << groupId << " with x = " << x
-            << " and limit = " << (limit == -1 ? 0 : limit) << std::endl;
+            << (limit > 0 ? " (time limit: " + std::to_string(limit) + "s)"
+                          : "")
+            << std::endl;
+}
+
+void handleGroupTimeout(int signal) {
+  std::lock_guard<std::mutex> lock(myMutex);
+  groupTimeout = true;
 }
 
 void clearGroup() {
@@ -104,7 +118,7 @@ void clearGroup() {
   groupTimeout = false;
 }
 
-void createComponent(char sym) {
+void createComponent(char sym, int limit) {
   Component component;
 
   component.ind = group.components.size() + 1;
@@ -120,15 +134,40 @@ void createComponent(char sym) {
   component.fifoPath = BASE_FIFO_PATH + "component_" +
                        std::to_string(group.ind) + "_" +
                        std::to_string(component.ind);
+  component.limit = limit;
 
   mknod(component.fifoPath.c_str(), S_IFIFO | 0666, 0);
 
   group.components.push_back(component);
 
   std::cout << "Computational component '" << sym
-            << "' with idx " + std::to_string(component.ind) +
+            << "' with idx " + std::to_string(component.ind)
+            << (limit > 0 ? " (time limit: " + std::to_string(limit) + "s)"
+                          : "") +
                    " added to group " + std::to_string(group.ind)
             << std::endl;
+}
+
+void monitorComponent(Component* component, std::map<int, Component*>& fds) {
+  std::this_thread::sleep_for(std::chrono::seconds(component->limit));
+
+  std::lock_guard<std::mutex> lock(myMutex);
+
+  if (!component->resultIsAvailable && !group.completed && !groupTimeout) {
+    std::cout << "Component " << component->ind
+              << " is cancelled due to the timeout." << std::endl;
+
+    kill(component->pid, SIGKILL);
+
+    auto it = std::find_if(
+        fds.begin(), fds.end(),
+        [component](const auto& pair) { return pair.second == component; });
+
+    if (it != fds.end()) {
+      close(it->first);
+      fds.erase(it);
+    }
+  }
 }
 
 void runGroup() {
@@ -142,7 +181,7 @@ void runGroup() {
     return;
   }
 
-  cout << "Running components..." << std::endl;
+  cout << "Computing..." << std::endl;
 
   std::map<int, Component*> fds;
   fd_set readfds;
@@ -198,6 +237,11 @@ void runGroup() {
       if (fifoFd > maxFd) {
         maxFd = fifoFd;
       }
+
+      if (component.limit > 0) {
+        std::thread timerThread(monitorComponent, &component, std::ref(fds));
+        timerThread.detach();
+      }
     }
   }
 
@@ -208,7 +252,8 @@ void runGroup() {
       FD_SET(fd, &readfds);
     }
 
-    int activity = select(maxFd + 1, &readfds, NULL, NULL, NULL);
+    struct timeval timeout = {1, 0};
+    int activity = select(maxFd + 1, &readfds, NULL, NULL, &timeout);
 
     if (activity < 0) {
       if (errno == EINTR) {
@@ -216,8 +261,11 @@ void runGroup() {
       }
       perror("select error");
       break;
+    } else if (activity == 0) {
+      continue;
     }
 
+    std::lock_guard<std::mutex> lock(myMutex);
     for (auto it = fds.begin(); it != fds.end();) {
       int fd = it->first;
       Component* component = it->second;
@@ -241,19 +289,23 @@ void runGroup() {
   }
 
   if (groupTimeout) {
-    std::cout << "Group timeout. Cancelling all components." << std::endl;
+    std::cout << "Cancelling all components due to the group timeout."
+              << std::endl;
     for (auto& component : group.components) {
       kill(component.pid, SIGKILL);
+      unlink(component.fifoPath.c_str());
+    }
+
+    group.completed = true;
+  } else {
+    for (auto& component : group.components) {
+      waitpid(component.pid, NULL, 0);
+      unlink(component.fifoPath.c_str());
     }
   }
 
-  for (auto& component : group.components) {
-    waitpid(component.pid, NULL, 0);
-    unlink(component.fifoPath.c_str());
-  }
-
-  cout << "Computation finished." << std::endl;
   group.completed = true;
+  cout << "Computation finished." << std::endl;
 }
 
 void printSummary() {
@@ -322,10 +374,23 @@ int main() {
 
       createGroup(groupId++, x, limit);
     } else if (cmd == "new") {
+      int limit = -1;
+      string next;
       char componentType;
       iss >> componentType;
 
-      createComponent(componentType);
+      if (iss >> next) {
+        std::transform(next.begin(), next.end(), next.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (next == "limit") {
+          iss >> limit;
+        } else {
+          std::cout << "Invalid command. Please try again." << std::endl;
+          continue;
+        }
+      }
+
+      createComponent(componentType, limit);
     } else if (cmd == "run") {
       runGroup();
     } else if (cmd == "summary") {
